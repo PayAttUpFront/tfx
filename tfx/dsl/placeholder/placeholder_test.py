@@ -16,7 +16,7 @@
 import copy
 import functools
 import os
-from typing import Type, TypeVar
+from typing import Callable, Sequence, TypeVar, Union
 
 import tensorflow as tf
 from tfx.dsl.placeholder import placeholder as ph
@@ -50,7 +50,7 @@ _P = TypeVar('_P', bound=message.Message)
 
 
 def load_testdata(
-    filename: str, proto_class: Type[_P] = placeholder_pb2.PlaceholderExpression
+    filename: str, proto_class: type[_P] = placeholder_pb2.PlaceholderExpression
 ) -> _P:
   test_pb_filepath = os.path.join(
       os.path.dirname(__file__), 'testdata', filename
@@ -446,10 +446,10 @@ class PlaceholderTest(tf.test.TestCase):
 
   def testListConcat(self):
     self._assert_placeholder_pb_equal_and_deepcopyable(
-        ph.to_list(
+        ph.make_list(
             [ph.input('model').uri, 'foo', ph.exec_property('random_str')]
         )
-        + ph.to_list([ph.input('another_model').uri]),
+        + ph.make_list([ph.input('another_model').uri]),
         """
         operator {
           list_concat_op {
@@ -509,9 +509,10 @@ class PlaceholderTest(tf.test.TestCase):
 
   def testListConcatAndSerialize(self):
     self._assert_placeholder_pb_equal_and_deepcopyable(
-        ph.to_list([ph.input('model').uri,
-                    ph.exec_property('random_str')
-                   ]).serialize_list(ph.ListSerializationFormat.JSON), """
+        ph.make_list(
+            [ph.input('model').uri, ph.exec_property('random_str')]
+        ).serialize_list(ph.ListSerializationFormat.JSON),
+        """
         operator {
           list_serialization_op {
             expression {
@@ -548,17 +549,21 @@ class PlaceholderTest(tf.test.TestCase):
             serialization_format: JSON
           }
         }
-    """)
+    """,
+    )
 
   def testListEmpty(self):
     self._assert_placeholder_pb_equal_and_deepcopyable(
-        ph.to_list([]), """
+        ph.make_list([]),
+        """
         operator {
           list_concat_op {}
         }
-    """)
+    """,
+    )
     self._assert_placeholder_pb_equal_and_deepcopyable(
-        ph.to_list([]) + ph.to_list([ph.exec_property('random_str')]), """
+        ph.make_list([]) + ph.make_list([ph.exec_property('random_str')]),
+        """
         operator {
           list_concat_op {
             expressions {
@@ -569,7 +574,8 @@ class PlaceholderTest(tf.test.TestCase):
             }
           }
         }
-    """)
+    """,
+    )
 
   def testMakeDict(self):
     self._assert_placeholder_pb_equal_and_deepcopyable(
@@ -918,6 +924,40 @@ class PlaceholderTest(tf.test.TestCase):
               }
             }
           }""")
+
+  def testJoinPath(self):
+    self._assert_placeholder_pb_equal_and_deepcopyable(
+        ph.join_path(ph.output('model').uri, 'foo.txt'),
+        """
+        operator {
+          join_path_op {
+            expressions {
+              operator {
+                artifact_uri_op {
+                  expression {
+                    operator {
+                      index_op {
+                        expression {
+                          placeholder {
+                            type: OUTPUT_ARTIFACT
+                            key: "model"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            expressions {
+              value {
+                string_value: "foo.txt"
+              }
+            }
+          }
+        }
+        """,
+    )
 
   def testComplicatedConcat(self):
     self._assert_placeholder_pb_equal_and_deepcopyable(
@@ -1716,7 +1756,7 @@ class PlaceholderTest(tf.test.TestCase):
     self.assertNotIn(ph.ChannelWrappedPlaceholder, ph_types)
 
   def testListTraverse(self):
-    p = ph.to_list([
+    p = ph.make_list([
         ph.runtime_info('platform_config').user,
         ph.output('model').uri,
         ph.exec_property('version'),
@@ -1739,6 +1779,18 @@ class PlaceholderTest(tf.test.TestCase):
     self.assertIn(ph.RuntimeInfoPlaceholder, ph_types)
     self.assertIn(placeholder_base.DictPlaceholder, ph_types)
     self.assertNotIn(ph.ChannelWrappedPlaceholder, ph_types)
+
+  def testJoinPathTraverse(self):
+    p = ph.join_path(
+        ph.output('model').uri,
+        ph.exec_property('subdir'),
+        'test.txt',
+    )
+    ph_types = [type(x) for x in p.traverse()]
+    self.assertIn(ph.ArtifactPlaceholder, ph_types)
+    self.assertIn(ph.ExecPropertyPlaceholder, ph_types)
+    self.assertNotIn(ph.ChannelWrappedPlaceholder, ph_types)
+    self.assertNotIn(ph.RuntimeInfoPlaceholder, ph_types)
 
   def testMakeProtoTraverse(self):
     p = _ExecutionInvocation(
@@ -1763,6 +1815,297 @@ class PlaceholderTest(tf.test.TestCase):
       # Iterate over a placeholder by mistake.
       for _ in p:
         break
+
+  def testPlaceholderEquality(self):
+    self.assertTrue(ph.input('foo').internal_equals(ph.input('foo')))
+    self.assertTrue(
+        (ph.input('foo') + 'x').internal_equals(ph.input('foo') + 'x')
+    )
+    self.assertFalse(
+        (ph.input('foo') + 'x').internal_equals(ph.input('foo') + 'y')
+    )
+    self.assertFalse(ph.input('foo').internal_equals(ph.output('foo')))
+    self.assertFalse(ph.input('foo').internal_equals(ph.exec_property('foo')))
+    self.assertTrue(
+        ph.exec_property('foo').internal_equals(ph.exec_property('foo'))
+    )
+    self.assertFalse(
+        ph.exec_property('foo').internal_equals(ph.exec_property('bar'))
+    )
+    self.assertTrue(
+        ph.runtime_info('executor_spec').internal_equals(
+            ph.runtime_info('executor_spec')
+        )
+    )
+    self.assertFalse(
+        ph.runtime_info('executor_spec').internal_equals(
+            ph.runtime_info('platform_config')
+        )
+    )
+    self.assertTrue(
+        ph.environment_variable('foo').internal_equals(
+            ph.environment_variable('foo')
+        )
+    )
+    self.assertFalse(
+        ph.environment_variable('foo').internal_equals(
+            ph.environment_variable('bar')
+        )
+    )
+    self.assertFalse(
+        ph.exec_property('foo').internal_equals(ph.environment_variable('foo'))
+    )
+
+  def testPlaceholderEquality_ProtoOperator(self):
+    self.assertTrue(
+        ph.execution_invocation().pipeline_run_id.internal_equals(
+            ph.execution_invocation().pipeline_run_id
+        )
+    )
+    self.assertFalse(
+        ph.execution_invocation().pipeline_run_id.internal_equals(
+            ph.execution_invocation().top_level_pipeline_run_id
+        )
+    )
+    self.assertTrue(
+        ph.execution_invocation()
+        .pipeline_node.upstream_nodes[0]
+        .internal_equals(
+            ph.execution_invocation().pipeline_node.upstream_nodes[0]
+        )
+    )
+    self.assertFalse(
+        ph.execution_invocation()
+        .pipeline_node.upstream_nodes[0]
+        .internal_equals(
+            ph.execution_invocation().pipeline_node.upstream_nodes[1]
+        )
+    )
+    self.assertFalse(
+        ph.execution_invocation()
+        .pipeline_node.upstream_nodes[0]
+        .internal_equals(ph.execution_invocation().pipeline_node.upstream_nodes)
+    )
+
+  def testPlaceholderEquality_Join(self):
+    ph_join: Callable[  # Narrow the return type (from str|Placeholder)
+        [Sequence[Union[str, ph.Placeholder]], str], ph.Placeholder
+    ] = ph.join
+    self.assertTrue(
+        ph_join(['a', ph.input('foo'), 'c'], 'x').internal_equals(
+            ph_join(['a', ph.input('foo'), 'c'], 'x')
+        )
+    )
+    self.assertFalse(
+        ph_join(['a', ph.input('foo'), 'c'], 'x').internal_equals(
+            ph_join(['a', ph.input('bar'), 'c'], 'x')
+        )
+    )
+    self.assertFalse(
+        ph_join(['a', ph.input('foo'), 'c'], 'x').internal_equals(
+            ph_join(['a', ph.input('foo')], 'x')
+        )
+    )
+    self.assertFalse(
+        ph_join(['a', ph.input('foo'), 'c'], 'x').internal_equals(
+            ph_join(['a', ph.input('foo'), 'c'], 'y')
+        )
+    )
+    self.assertTrue(
+        ph.join_path(ph.input('foo').uri, '/bar').internal_equals(
+            ph.join_path(ph.input('foo').uri, '/bar')
+        )
+    )
+    self.assertFalse(
+        ph.join_path(ph.input('foo').uri, '/bar').internal_equals(
+            ph.join_path(ph.input('baz').uri, '/bar')
+        )
+    )
+    self.assertFalse(
+        ph.join_path(ph.input('foo').uri, '/bar').internal_equals(
+            ph.join_path(ph.input('foo').uri)
+        )
+    )
+    self.assertFalse(
+        ph.join_path(ph.input('foo').uri, '/bar').internal_equals(
+            ph.join_path(ph.input('foo').uri, ph.input('bar').uri)
+        )
+    )
+
+  def testPlaceholderEquality_List(self):
+    self.assertTrue(ph.make_list([]).internal_equals(ph.make_list([])))
+    self.assertTrue(
+        ph.make_list(['a', ph.input('foo'), 'c']).internal_equals(
+            ph.make_list(['a', ph.input('foo'), 'c'])
+        )
+    )
+    self.assertFalse(
+        ph.make_list(['a', ph.input('foo'), 'c']).internal_equals(
+            ph.make_list(['a2', ph.input('foo'), 'c'])
+        )
+    )
+    self.assertFalse(
+        ph.make_list(['a', ph.input('foo'), 'c']).internal_equals(
+            ph.make_list(['a', ph.input('bar'), 'c'])
+        )
+    )
+    self.assertFalse(ph.make_list([]).internal_equals(ph.input('foo')))
+
+  def testPlaceholderEquality_Dict(self):
+    self.assertTrue(
+        placeholder_base.make_dict([]).internal_equals(
+            placeholder_base.make_dict([])
+        )
+    )
+    self.assertTrue(
+        placeholder_base.make_dict({}).internal_equals(
+            placeholder_base.make_dict({})
+        )
+    )
+    self.assertTrue(
+        placeholder_base.make_dict(
+            {'a': ph.input('foo'), 'b': ph.input('bar')}
+        ).internal_equals(
+            placeholder_base.make_dict(
+                {'a': ph.input('foo'), 'b': ph.input('bar')}
+            )
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict(
+            {'a': ph.input('foo'), 'b': ph.input('bar')}
+        ).internal_equals(
+            placeholder_base.make_dict(
+                {'a': ph.input('foo'), 'b': ph.input('baz')}
+            )
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict(
+            {'a': ph.input('foo'), 'b': ph.input('bar')}
+        ).internal_equals(
+            placeholder_base.make_dict(
+                {'a': ph.input('foo'), 'c': ph.input('bar')}
+            )
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict({'a': ph.input('foo')}).internal_equals(
+            placeholder_base.make_dict(
+                {'a': ph.input('foo'), 'b': ph.input('bar')}
+            )
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict(
+            {'a': ph.input('foo'), 'b': ph.input('bar')}
+        ).internal_equals(placeholder_base.make_dict({'a': ph.input('foo')}))
+    )
+    self.assertTrue(
+        placeholder_base.make_dict(
+            [(ph.input('foo').uri, 'testvalue')]
+        ).internal_equals(
+            placeholder_base.make_dict([(ph.input('foo').uri, 'testvalue')])
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict(
+            [(ph.input('foo').uri, 'testvalue')]
+        ).internal_equals(
+            placeholder_base.make_dict([(ph.input('bar').uri, 'testvalue')])
+        )
+    )
+    self.assertFalse(
+        placeholder_base.make_dict({}).internal_equals(ph.input('foo'))
+    )
+
+  def testPlaceholderEquality_MakeProto(self):
+    self.assertTrue(
+        _ExecutionInvocation().internal_equals(_ExecutionInvocation())
+    )
+    self.assertFalse(_ExecutionInvocation().internal_equals(ph.input('foo')))
+    self.assertTrue(
+        ph.make_proto(
+            execution_invocation_pb2.ExecutionInvocation(tmp_dir='/foo'),
+            pipeline_run_id=ph.input('foo').uri,
+        ).internal_equals(
+            ph.make_proto(
+                execution_invocation_pb2.ExecutionInvocation(tmp_dir='/foo'),
+                pipeline_run_id=ph.input('foo').uri,
+            )
+        )
+    )
+    self.assertFalse(
+        ph.make_proto(
+            execution_invocation_pb2.ExecutionInvocation(tmp_dir='/foo'),
+            pipeline_run_id=ph.input('foo').uri,
+        ).internal_equals(
+            ph.make_proto(
+                execution_invocation_pb2.ExecutionInvocation(tmp_dir='/bar'),
+                pipeline_run_id=ph.input('foo').uri,
+            )
+        )
+    )
+    self.assertFalse(
+        ph.make_proto(
+            execution_invocation_pb2.ExecutionInvocation(tmp_dir='/foo'),
+            pipeline_run_id=ph.input('foo').uri,
+        ).internal_equals(
+            ph.make_proto(
+                execution_invocation_pb2.ExecutionInvocation(tmp_dir='/foo'),
+                pipeline_run_id=ph.input('bar').uri,
+            )
+        )
+    )
+
+  def testPlaceholderEquality_ArtifactProperty(self):
+    self.assertTrue(
+        ph.input('foo')
+        .property('p1')
+        .internal_equals(ph.input('foo').property('p1'))
+    )
+    self.assertFalse(
+        ph.input('foo')
+        .property('p1')
+        .internal_equals(ph.input('bar').property('p1'))
+    )
+    self.assertFalse(
+        ph.input('foo')
+        .property('p1')
+        .internal_equals(ph.input('foo').property('p2'))
+    )
+    self.assertFalse(
+        ph.input('foo')
+        .property('p1')
+        .internal_equals(ph.input('foo').custom_property('p1'))
+    )
+
+  def testPredicateEquality(self):
+    p1 = ph.input('p1')
+    p2 = ph.input('p2')
+    p3 = ph.output('p1')
+    self.assertTrue((p1 == p1).internal_equals(p1 == p1))  # pylint: disable=comparison-with-itself
+    self.assertTrue((p1 == p2).internal_equals(p1 == p2))
+    self.assertFalse((p1 == p2).internal_equals(p1 == p3))
+    self.assertTrue((p1 < p2).internal_equals(p1 < p2))
+    self.assertFalse((p1 < p3).internal_equals(p1 < p2))
+    self.assertFalse((p1 < p2).internal_equals(p1 > p2))
+    self.assertTrue(
+        ph.logical_not(p1 == p2).internal_equals(ph.logical_not(p1 == p2))
+    )
+    self.assertFalse(
+        ph.logical_not(p1 == p2).internal_equals(ph.logical_not(p1 == p3))
+    )
+    self.assertTrue(
+        ph.logical_and(p1 == p2, p2 == p3).internal_equals(
+            ph.logical_and(p1 == p2, p2 == p3)
+        )
+    )
+    self.assertFalse(
+        ph.logical_and(p1 == p2, p2 == p3).internal_equals(
+            ph.logical_or(p1 == p2, p2 == p3)
+        )
+    )
 
 
 class EncodeValueLikeTest(tf.test.TestCase):
@@ -1821,7 +2164,3 @@ class EncodeValueLikeTest(tf.test.TestCase):
   def testFailsOnInvalidInput(self):
     with self.assertRaises(ValueError):
       placeholder_base.encode_value_like(self)
-
-
-if __name__ == '__main__':
-  tf.test.main()

@@ -181,6 +181,7 @@ def rolling_range(
     keep_all_versions: bool = False,
     exclude_span_numbers: Sequence[int] = (),
     min_spans: Optional[int] = None,
+    version_sort_keys: Sequence[str] = (),
 ):
   """Returns artifacts with spans in a rolling range.
 
@@ -200,7 +201,9 @@ def rolling_range(
   sorted_spans[:-skip_num_recent_spans][-num_spans:]
 
   This resolver function is based on the span-version semantics, which only
-  considers the latest version of each span. If you want to keep all versions,
+  considers the latest version of each span. The version semantics can be
+  optionally changed by providing a list of artifact attributes that can be used
+  to sort versions within a particular span. If you want to keep all versions,
   then set keep_all_versions=True. Input artifacts must have both "span" int
   property and "version" int property.
 
@@ -259,6 +262,11 @@ def rolling_range(
     exclude_span_numbers: The span numbers to exclude.
     min_spans: Minimum number of desired example spans in the range. If
       min_spans is None, it is set to num_spans.
+    version_sort_keys: List of string artifact attributes to sort or filter the
+      versions witin the spans, applied in order of specification. Nested keys
+      can use '.' separator for e.g. 'mlmd_artifact.create_time_since_epoch'. It
+      can be used to override the default behavior, which is sort by version
+      number and break ties by create time and id.
 
   Returns:
     Artifacts with spans in the rolling range.
@@ -269,6 +277,7 @@ def rolling_range(
       n=num_spans,
       skip_last_n=skip_num_recent_spans,
       keep_all_versions=keep_all_versions,
+      version_sort_keys=version_sort_keys,
   )
   if exclude_span_numbers:
     resolved_artifacts = ops.ExcludeSpans(
@@ -415,6 +424,7 @@ def sequential_rolling_range(
     skip_num_recent_spans: int = 0,
     keep_all_versions: bool = False,
     exclude_span_numbers: Sequence[int] = (),
+    stride: int = 1,
 ):
   """Returns artifacts with spans in a sequential rolling range.
 
@@ -426,9 +436,9 @@ def sequential_rolling_range(
   exclude_span_numbers, for details see the ConsecutiveSpans ResolverOp
   implementation.
 
-  The window size is num_spans and has a stride of 1. If the spans are not
-  consecutive, then the sequential rolling range waits for the missing span to
-  arrive.
+  The window size is num_spans and the sliding window has a default stride of 1.
+  If the spans are not consecutive, then the sequential rolling range waits for
+  the missing span to arrive.
 
   This resolver function is based on the span-version semantics, which only
   considers the latest version of each span. If you want to keep all versions,
@@ -451,7 +461,7 @@ def sequential_rolling_range(
     The consecutive spans to consider are [1, 2, 3, 4]
 
     The artifacts will be returned with a sliding window of size num_spans=3 and
-    stride 1 applied:
+    stride=1 applied:
 
     [[A, B, C], [B, C, D]]
 
@@ -482,6 +492,7 @@ def sequential_rolling_range(
       If false then if multiple artifacts have the same span, only the span with
       the latest version is kept. Defaults to False.
     exclude_span_numbers: The list of missing/bad span numbers to exclude.
+    stride: The step size of the sliding window. Must be > 0, defaults to 1.
 
   Returns:
     Artifacts with spans in the sequential rolling range.
@@ -494,7 +505,9 @@ def sequential_rolling_range(
       denylist=exclude_span_numbers,
   )
 
-  return ops.SlidingWindow(resolved_artifacts, window_size=num_spans)
+  return ops.SlidingWindow(
+      resolved_artifacts, window_size=num_spans, stride=stride
+  )
 
 
 @sequential_rolling_range.output_type_inferrer
@@ -503,46 +516,99 @@ def _infer_seqential_rolling_range_type(channel, **kwargs):  # pylint: disable=u
 
 
 @resolver_function.resolver_function()
-def paired_spans(artifacts, *, keep_all_versions: bool = False):
+def paired_spans(
+    artifacts,
+    *,
+    match_version: bool = True,
+    keep_all_versions: bool = False,
+):
   """Pairs up Examples from different channels, matching by (span, version).
 
   This enables grouping together Artifacts from separate channels.
 
   Example usage:
 
-  Consider two channels A and B.
+  NOTE: Notation here is `{artifact_type}:{span}:{version}`
 
-  Channel A: [(span 0, version 0), (span 0, version 1), (span 1, version 0)]
-  Channel B: [(span 0, verison 0), (span 0, version 1)]
+  >>> paired_spans({'x': channel([X:0:0, X:0:1, X:1:0, X:2:0]),
+                    'y': channel([Y:0:0, Y:0:1, Y:1:0, Y:3:0])})
+  Loopable([
+      {'x': channel([X:0:1]), 'y': channel([Y:0:1])},
+      {'x': channel([X:1:0]), 'y': channel([Y:1:0])},
+  ])
 
-  With keep_all_verisons=True, paired_spans() will give the following output:
+  Note that the span `0` has two versions, but only the latest version `1` is
+  selected. This is the default semantics of the span & version where only the
+  latest version is considered valid of each span.
 
-  [{'channel_a' : [(span 0, version 0)], 'channel_b' : [(span 0, version 0)]},
-   {'channel_a' : [(span 0, version 1)], 'channel_b' : [(span 0, version 1)]}]
+  If you want to select all versions including the non-latest ones, you can
+  set `keep_all_versions=True`.
 
-  With keep_all_verisons=False, paired_spans() will give the following output:
+  >>> paired_spans({'x': channel([X:0:0, X:0:1, X:1:0]),
+                    'y': channel([Y:0:0, Y:0:1, Y:1:0]},
+                    keep_all_versions=True)
+  Loopable([
+      {'x': channel([X:0:0]), 'y': channel([Y:0:0])},
+      {'x': channel([X:0:1]), 'y': channel([Y:0:1])},
+      {'x': channel([X:1:0]), 'y': channel([Y:1:0])},
+  ])
 
-  [{'channel_a' : [(span 0, version 1)], 'channel_b' : [(span 0, version 1)]}]
+  By default, the version property is considered for pairing, meaning that the
+  version should exact match, otherwise it is not considered the pair.
 
-  Since paired_spans() returns a list of dicts, it must be used together
-  with ForEach. For example:
+  >>> paired_spans({'x': channel([X:0:999, X:1:999]),
+                    'y': channel([Y:0:0, Y:1:0])})
+  Loopable([])
 
-  with ForEach(paired_spans({'a' : channel_a, 'b' : channel_b})) as paired_dict:
-    component = Component(a=paired_dict['a'], b=paired_dict['b'])
+  If you do not care about version, and just want to pair artifacts that
+  consider only the span property (and select latest version for each span),
+  you can set `match_version=False`.
 
-  Note, paired_spans() can pair Artifacts from N >= 2 channels.
+  >>> paired_spans({'x': channel([X:0:999, X:1:999]),
+                    'y': channel([Y:0:0, Y:1:0, Y:1:1])},
+                    match_version=False)
+  Loopable([
+      {'x': channel([X:0:999]), 'y': channel([Y:0:0])},
+      {'x': channel([X:1:999]), 'y': channel([Y:1:1])},
+  ])
+
+  Since `match_version=False` only consideres the latest version of each span,
+  this cannot be used together with `keep_all_versions=True`.
+
+  As `paired_spans` returns a `Loopable`, it must be used together with
+  `ForEach`. For example:
+
+  ```python
+  with ForEach(paired_spans({'a' : channel_a, 'b' : channel_b})) as pair:
+    component = Component(a=pair['a'], b=pair['b'])
+  ```
+
+  NOTE: `paired_spans` can pair Artifacts from N >= 2 channels.
 
   Args:
     artifacts: A dictionary of artifacts.
+    match_version: Whether the version of each span should exactly match.
     keep_all_versions: Whether to pair up all versions of artifacts, or only the
-      latest version. Defaults to False.
+      latest version. Defaults to False. Requires match_version = True.
 
   Returns:
     A list of artifact dicts where each dict has as its key the channel key,
     and as its value has a list with a single artifact having the same span and
     version across the dict.
   """
-  return ops.PairedSpans(artifacts, keep_all_versions=keep_all_versions)
+  if keep_all_versions and not match_version:
+    raise ValueError('keep_all_versions = True requires match_version = True.')
+
+  # TODO: b/322812375 - Remove kwargs dict handling once orchestrator knows
+  # match_version argument.
+  kwargs = {}
+  if not match_version:
+    kwargs['match_version'] = False
+  return ops.PairedSpans(
+      artifacts,
+      keep_all_versions=keep_all_versions,
+      **kwargs,
+  )
 
 
 @resolver_function.resolver_function
@@ -561,8 +627,8 @@ def filter_property_equal(
 
   filter_property_equal(
       [A, B, C],
-      property_key='blessed',
-      property_value=False,
+      key='blessed',
+      value=False,
   )
 
   will return [C].
@@ -583,6 +649,13 @@ def filter_property_equal(
   )
 
 
+@filter_property_equal.output_type_inferrer
+def _infer_filter_property_equal_type(
+    channel: channel_types.BaseChannel, **kwargs  # pylint: disable=unused-argument
+):
+  return channel.type
+
+
 @resolver_function.resolver_function
 def filter_custom_property_equal(
     artifacts,
@@ -599,8 +672,8 @@ def filter_custom_property_equal(
 
   filter_custom_property_equal(
       [A, B, C],
-      property_key='purity',
-      property_value=2,
+      key='purity',
+      value=2,
   )
 
   will return [C].
@@ -619,6 +692,13 @@ def filter_custom_property_equal(
       property_value=value,
       is_custom_property=True,
   )
+
+
+@filter_custom_property_equal.output_type_inferrer
+def _infer_filter_custom_property_equal_type(
+    channel: channel_types.BaseChannel, **kwargs  # pylint: disable=unused-argument
+):
+  return channel.type
 
 
 @resolver_function.resolver_function

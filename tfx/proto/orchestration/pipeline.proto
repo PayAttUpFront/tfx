@@ -185,11 +185,14 @@ message PropertyPredicate {
     // The right-hand side element to the logical operator.
     PropertyPredicate rhs = 3;
   }
+
   oneof operator {
     ValueComparator value_comparator = 1;
     UnaryLogicalOperator unary_logical_operator = 2;
     BinaryLogicalOperator binary_logical_operator = 3;
   }
+
+  reserved 4;
 }
 
 // InputGraph expresses a declarative input resolution logic with a graph of
@@ -622,16 +625,15 @@ message NodeExecutionOptions {
   // Current behavior for ASYNC pipelines is undefined.
   // TODO(b/298253165)
   message ResourceLifetime {
-    // This is an experimental feature to enable "end nodes" in a pipeline to
+    // This is a feature to enable "end nodes" in a pipeline to
     // support resource lifetimes. If this field is set then the node which this
     // NodeExecutionOptions belongs to will run during pipeline finalization if
-    // the "lifetime_start" has run succesfully.
+    // the "lifetime_start" node has run succesfully.
     // Pipeline finalization happens when:
     // 1. All nodes in the pipeline completed, this is the "happy path".
     // 2. A user requests for the pipeline to stop
     // 3. A node fails in the pipeline and it cannot continue executing.
     // This should be the id of the node "starting" a lifetime.
-    // If you want to use this feature please contact kmonte@ first.
     oneof paired_lifetime {
       // If set then the node this NodeExecutionOptions belongs to marks the end
       // of some lifetime.
@@ -720,6 +722,21 @@ message PipelineRuntimeSpec {
 message PipelineInfo {
   // Required field. A pipeline must have an id.
   string id = 1;
+
+  // The ids of all the parent pipelines of a sub-pipeline.
+  // The order of ids represents the path from root pipeline (inclusive) to the
+  // given sub-pipeline (exclusive).
+  //
+  // For the composable pipeline example below, `parent_ids` of child-pipeline
+  // would be ["root-pipeline", "parent-pipeline"].
+  //  root-pipeline {
+  //    parent-pipeline {
+  //      child-pipeline {}
+  //    }
+  //  }
+  //
+  // Optional. Only used by sub-pipelines.
+  repeated string parent_ids = 2;
 }
 
 // Definition for a uDSL pipeline. This is also the definition of a

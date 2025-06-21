@@ -39,6 +39,7 @@ message PlaceholderExpressionOperator {
     ArtifactUriOperator artifact_uri_op = 1;
     ArtifactValueOperator artifact_value_op = 2;
     ConcatOperator concat_op = 3;
+    JoinPathOperator join_path_op = 15;
     IndexOperator index_op = 4;
     ProtoOperator proto_op = 5;
     Base64EncodeOperator base64_encode_op = 6;
@@ -50,7 +51,14 @@ message PlaceholderExpressionOperator {
     ListConcatOperator list_concat_op = 12;
     MakeDictOperator make_dict_op = 13;
     MakeProtoOperator make_proto_op = 14;
+    DirNameOperator dir_name_op = 16;
   }
+}
+
+// DirNameOperator extracts the directory name from a file path.
+message DirNameOperator {
+  // Required. It must evaluate to a file path string.
+  PlaceholderExpression expression = 1;
 }
 
 // ArtifactUriOperator extracts the Artifact URI from a placeholder expression.
@@ -91,6 +99,12 @@ message ArtifactValueOperator {
 // ConcatOperator: List[String] -> String
 message ConcatOperator {
   // Required. The placeholders to be concatenated.
+  repeated PlaceholderExpression expressions = 1;
+}
+
+// JoinPathOperator calls os.path.join(*args).
+// JoinPathOperator: List[str] -> str
+message JoinPathOperator {
   repeated PlaceholderExpression expressions = 1;
 }
 

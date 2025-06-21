@@ -20,6 +20,8 @@ from typing import Optional
 
 from tfx.proto.orchestration import pipeline_pb2
 
+TriggerStrategy = pipeline_pb2.NodeExecutionOptions.TriggerStrategy
+
 
 @dataclasses.dataclass
 class NodeExecutionOptions:
@@ -27,8 +29,9 @@ class NodeExecutionOptions:
 
   Currently only apply in experimental orchestrator.
   """
-  trigger_strategy: pipeline_pb2.NodeExecutionOptions.TriggerStrategy = (
-      pipeline_pb2.NodeExecutionOptions.TRIGGER_STRATEGY_UNSPECIFIED)
+  trigger_strategy: TriggerStrategy = (
+      TriggerStrategy.ALL_UPSTREAM_NODES_SUCCEEDED
+  )
   success_optional: bool = False
   max_execution_retries: Optional[int] = None
   execution_timeout_sec: int = 0
@@ -39,17 +42,21 @@ class NodeExecutionOptions:
   # new stateful working dir will be created for every new execution.
   reset_stateful_working_dir: bool = False
 
-  # This is an experimental feature to enable "end nodes" in a pipeline to
+  # This is a feature to enable "end nodes" in a pipeline to
   # support resource lifetimes. If this field is set then the node which this
   # NodeExecutionOptions belongs to will run during pipeline finalization if the
-  # "lifetime_start" has run succesfully.
+  # "lifetime_start" node has run succesfully.
   # Pipeline finalization happens when:
   # 1. All nodes in the pipeline completed, this is the "happy path".
   # 2. A user requests for the pipeline to stop
   # 3. A node fails in the pipeline and it cannot continue executing.
   # This should be the id of the node "starting" a lifetime.
-  # If you want to use this feature please contact kmonte@ first.
   lifetime_start: Optional[str] = None
+
+  # TFX only, do not set manually.
+  _run_mode: pipeline_pb2.NodeExecutionOptions.RunMode = (
+      pipeline_pb2.NodeExecutionOptions.RunMode.DEFAULT
+  )
 
   def __post_init__(self):
     if self.max_execution_retries is not None:

@@ -17,14 +17,26 @@ import inspect
 from typing import Any, Callable, Mapping, Optional, Type
 
 from tfx import types
+from tfx.dsl.component.experimental import json_compat
 from tfx.dsl.component.experimental import utils
 from tfx.dsl.components.base import base_component
 from tfx.dsl.components.base import executor_spec as base_executor_spec
 from tfx.orchestration.portable.execution import context
 from tfx.proto.orchestration import executable_spec_pb2
 from tfx.types import component_spec
+from tfx.types import standard_artifacts
 from tfx.types.system_executions import SystemExecution
 from tfx.utils import name_utils
+from tfx.utils import pure_typing_utils
+
+
+_VALUE_ARTIFACT_TO_TYPE = {
+    standard_artifacts.Integer: int,
+    standard_artifacts.Float: float,
+    standard_artifacts.String: str,
+    standard_artifacts.Bytes: bytes,
+    standard_artifacts.Boolean: bool,
+}
 
 
 def _convert_function_to_python_executable_spec(
@@ -43,17 +55,26 @@ def _convert_function_to_python_executable_spec(
 
 
 def _type_check_execution_function_params(
-    spec: component_spec.ComponentSpec,
-    execution_hook_fn: Optional[Callable[..., Any]] = None,
+    spec: type[component_spec.ComponentSpec],
+    fn: Optional[Callable[..., Any]] = None,
 ) -> None:
-  """Validates execution hook function args with the type check."""
-  if execution_hook_fn is None:
+  """Validates if the function parameter is aligned with the component spec.
+
+  The function can have the flattened input / output / exec_properties as
+  parameter whose name matches the dict key and annotated type matches
+  the Artifact type or data type.
+
+  Args:
+    spec: A component spec.
+    fn: A function that is supposed to be aligned with the given component spec.
+  """
+  if fn is None:
     return
 
   channel_parameters = {}
   for parameters in (spec.INPUTS, spec.OUTPUTS):
     channel_parameters.update(parameters)
-  signature = inspect.signature(execution_hook_fn)
+  signature = inspect.signature(fn)
 
   # Execution function type check.
   for param_name in signature.parameters:
@@ -66,30 +87,60 @@ def _type_check_execution_function_params(
 
     if param_name in channel_parameters:
       channel = channel_parameters[param_name]
+      allowed_param_types = []
 
-      allowed_param_types = [list[channel.type], Optional[channel.type]]
-      if not channel.optional:
-        allowed_param_types.append(channel.type)
+      if not issubclass(channel.type, standard_artifacts.ValueArtifact):
+        allowed_param_types = [
+            list[channel.type],
+            Optional[channel.type] if channel.optional else channel.type,
+        ]
+      elif param_name in spec.INPUTS:
+        if channel.type in _VALUE_ARTIFACT_TO_TYPE:
+          # Primitvie ValueArtifact input can be annotated as a primitive type.
+          primitive_type = _VALUE_ARTIFACT_TO_TYPE[channel.type]
+          allowed_param_types.append(
+              Optional[primitive_type] if channel.optional else primitive_type
+          )
+        else:
+          # JsonValue artifact type.
+          is_param_optional, inner_param_type = (
+              pure_typing_utils.maybe_unwrap_optional(param_type)
+          )
+          if (
+              json_compat.is_json_compatible(inner_param_type)
+              and is_param_optional == channel.optional
+          ):
+            continue  # Type check okay
+          else:
+            allowed_param_types.append(
+                'Optional[JsonableType]' if channel.optional else 'JsonableType'
+            )
+            raise TypeError(
+                f'Parameter type mismatched {param_name}: {param_type} from the'
+                f' executable function {fn.__name__}. The allowed'
+                f' types are {allowed_param_types}.'
+            )
+
       # TODO(wssong): We should care for AsyncOutputArtifact type annotation for
       # channels with is_async=True (go/tflex-list-output).
 
       if param_type not in allowed_param_types:
         raise TypeError(
             f'Parameter type mismatched {param_name}: {param_type} from the'
-            f' executable function {execution_hook_fn.__name__}. The allowed'
+            f' executable function {fn.__name__}. The allowed'
             f' types are {allowed_param_types}.'
         )
     elif param_name in spec.PARAMETERS:
       exec_prop = spec.PARAMETERS[param_name]
 
-      allowed_param_types = [Optional[exec_prop.type]]
-      if not exec_prop.optional:
-        allowed_param_types.append(exec_prop.type)
+      allowed_param_types = [
+          Optional[exec_prop.type] if exec_prop.optional else exec_prop.type
+      ]
 
       if param_type not in allowed_param_types:
         raise TypeError(
             f'Parameter type mismatched {param_name}: {param_type} from the'
-            f' executable function {execution_hook_fn.__name__}. The allowed'
+            f' executable function {fn.__name__}. The allowed'
             f' types are {allowed_param_types}.'
         )
     elif param_type is context.ExecutionContext:
@@ -98,7 +149,7 @@ def _type_check_execution_function_params(
     else:
       raise AttributeError(
           f'Unsupported parameter {param_name}: {param_type} from the'
-          f' executable function {execution_hook_fn.__name__}. Parameter should'
+          f' executable function {fn.__name__}. Parameter should'
           ' be inputs or outputs of the component, or the ExecutionContext'
           ' variable.'
       )
@@ -138,7 +189,9 @@ def create_tfx_component_class(
   )
 
   for fn in (pre_execution, post_execution):
-    _type_check_execution_function_params(tfx_component_spec_class, fn)
+    if fn is not None:
+      _type_check_execution_function_params(tfx_component_spec_class, fn)
+      utils.assert_no_private_func_in_main(fn)
   try:
     pre_execution_spec, post_execution_spec = [
         _convert_function_to_python_executable_spec(fn)

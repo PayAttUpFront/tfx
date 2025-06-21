@@ -18,7 +18,6 @@ from typing import Any, Dict, List
 from absl import logging
 import tensorflow_data_validation as tfdv
 from tensorflow_data_validation.statistics import stats_options as options
-from tensorflow_data_validation.utils import dashboard_util
 from tfx import types
 from tfx.components.statistics_gen import stats_artifact_utils
 from tfx.components.util import examples_utils
@@ -28,6 +27,7 @@ from tfx.types import artifact_utils
 from tfx.types import standard_component_specs
 from tfx.utils import io_utils
 from tfx.utils import json_utils
+from tfx.utils import stats_utils
 
 
 # Default file name for stats generated.
@@ -35,6 +35,7 @@ DEFAULT_FILE_NAME = 'FeatureStats.pb'
 
 _TELEMETRY_DESCRIPTORS = ['StatisticsGen']
 STATS_DASHBOARD_LINK = 'stats_dashboard_link'
+SAMPLE_RATE_BY_SPLIT_PROPERTY_NAME = 'sample_rate_by_split'
 
 
 class Executor(base_beam_executor.BaseBeamExecutor):
@@ -72,6 +73,10 @@ class Executor(base_beam_executor.BaseBeamExecutor):
           not also contain a schema.
         - exclude_splits: JSON-serialized list of names of splits where
           statistics and sample should not be generated.
+        - sample_rate_by_split: Optionally, A dict mapping split_name to sample
+          rate, which is used to apply a different sample rate to the
+          corresponding split. When this is supplied, it will overwrite the
+          single sample rate on stats_options_json.
 
     Raises:
       ValueError when a schema is provided both as an input and as part of the
@@ -99,6 +104,16 @@ class Executor(base_beam_executor.BaseBeamExecutor):
           % type(exclude_splits)
       )
 
+    # Load sample_rate_by_split from execution properties.
+    sample_rate_by_split = (
+        json_utils.loads(
+            exec_properties.get(
+                standard_component_specs.SAMPLE_RATE_BY_SPLIT_KEY, 'null'
+            )
+        )
+        or {}
+    )
+
     # Setup output splits.
     examples = artifact_utils.get_single_instance(
         input_dict[standard_component_specs.EXAMPLES_KEY]
@@ -117,6 +132,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
       splits = artifact_utils.decode_split_names(examples.split_names)
 
     split_names = [split for split in splits if split not in exclude_splits]
+
     statistics_artifact = artifact_utils.get_single_instance(
         output_dict[standard_component_specs.STATISTICS_KEY]
     )
@@ -129,21 +145,41 @@ class Executor(base_beam_executor.BaseBeamExecutor):
 
     try:
       statistics_artifact.set_string_custom_property(
-          STATS_DASHBOARD_LINK, dashboard_util.generate_stats_dashboard_link()
+          STATS_DASHBOARD_LINK,
+          stats_utils.generate_stats_dashboard_link(statistics_artifact),
       )
     except Exception as e:  # pylint: disable=broad-except
       # log on failures to not bring down Statsgen jobs
-      logging.error('Failed to generate stats dashboard link because %s', e)
+      logging.exception('Failed to generate stats dashboard link because %s', e)
       statistics_artifact.set_string_custom_property(STATS_DASHBOARD_LINK, '')
 
     stats_options = options.StatsOptions()
     stats_options_json = exec_properties.get(
         standard_component_specs.STATS_OPTIONS_JSON_KEY
     )
+
     if stats_options_json:
       # TODO(b/150802589): Move jsonable interface to tfx_bsl and use
       # json_utils
       stats_options = options.StatsOptions.from_json(stats_options_json)
+
+    sample_rate_by_split_property = {
+        split: stats_options.sample_rate or 1.0 for split in split_names
+    }
+    for split in sample_rate_by_split:
+      # Check if sample_rate_by_split contains invalid split names
+      if split not in split_names:
+        logging.error(
+            'Split %s provided in sample_rate_by_split is not valid.', split
+        )
+        continue
+      sample_rate_by_split_property[split] = sample_rate_by_split[split]
+
+    # Add sample_rate_by_split property to statistics artifact
+    statistics_artifact.set_json_value_custom_property(
+        SAMPLE_RATE_BY_SPLIT_PROPERTY_NAME,
+        json_utils.dumps(sample_rate_by_split_property),
+    )
 
     write_sharded_output = exec_properties.get(
         standard_component_specs.SHARDED_STATS_OUTPUT_KEY, False
@@ -209,6 +245,15 @@ class Executor(base_beam_executor.BaseBeamExecutor):
         )
         binary_stats_output_path = os.path.join(output_uri, DEFAULT_FILE_NAME)
 
+        # Update sample rate for each split in stats_options if
+        # sample_rate_by_split is provided
+        split_stats_options = tfdv.StatsOptions.from_json(
+            stats_options.to_json())
+        if sample_rate_by_split:
+          sample_rate = sample_rate_by_split.get(split, None)
+          if sample_rate is not None:
+            split_stats_options.sample_rate = sample_rate
+
         data = p | 'TFXIORead[%s]' % split >> tfxio.BeamSource()
         if write_sharded_output:
           sharded_stats_output_prefix = os.path.join(
@@ -227,7 +272,7 @@ class Executor(base_beam_executor.BaseBeamExecutor):
         _ = (
             data
             | 'GenerateStatistics[%s]' % split
-            >> tfdv.GenerateStatistics(stats_options)
+            >> tfdv.GenerateStatistics(split_stats_options)
             | 'WriteStatsOutput[%s]' % split >> write_transform
         )
         logging.info(

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Portable library for registering and publishing executions."""
+
 from typing import Mapping, Optional, Sequence
 import uuid
 
@@ -19,14 +20,11 @@ from tfx import types
 from tfx.orchestration import data_types_utils
 from tfx.orchestration import metadata
 from tfx.orchestration.portable import merge_utils
-from tfx.orchestration.portable import outputs_utils
 from tfx.orchestration.portable.mlmd import execution_lib
 from tfx.proto.orchestration import execution_result_pb2
 from tfx.utils import typing_utils
 
 from ml_metadata.proto import metadata_store_pb2
-
-_RESOLVED_AT_RUNTIME = outputs_utils.RESOLVED_AT_RUNTIME
 
 
 def publish_cached_executions(
@@ -98,7 +96,7 @@ def publish_succeeded_execution(
       event with type OUTPUT.
     executor_output: Executor outputs. `executor_output.output_artifacts` will
       be used to update system-generated output artifacts passed in through
-      `output_artifacts` arg. There are three contraints to the update: 1. The
+      `output_artifacts` arg. There are three constraints to the update: 1. The
       keys in `executor_output.output_artifacts` are expected to be a subset of
       the system-generated output artifacts dict. 2. An update to a certain key
       should contains all the artifacts under that key. 3. An update to an
